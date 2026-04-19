@@ -1,0 +1,253 @@
+Section 1 — Project Setup (Steps 1–12)
+Step 1 — Create the Flutter project with the correct organization identifier.
+Your bundle ID and package name are permanent. They are baked into your Apple Developer account, your Google Play Console, your Firebase project, and your Supabase OAuth redirect URIs. Choose once. Format: com.yourcompany.appname all lowercase, no hyphens. A wrong bundle ID means recreating OAuth credentials. Do this right.
+Step 2 — Decide your minimum OS targets now and never change them.
+For iOS: minimum iOS 16. Reason: Sign In with Apple credential state API behaves consistently from iOS 16 onwards. Below that you get edge cases in credential revocation detection. For Android: minimum SDK 24 (Android 7). Below that, Google Sign In has known issues and your user base below SDK 24 is statistically negligible at this point.
+Step 3 — Set up your folder structure before writing any code.
+This is the structure you commit to forever. Inside lib:
+lib/
+  core/
+    constants/
+    errors/
+    network/
+    routing/
+    theme/
+    utils/
+  features/
+    auth/
+      data/
+        datasources/
+        models/
+        repositories/
+      domain/
+        entities/
+        repositories/
+        usecases/
+      presentation/
+        bloc/
+        pages/
+        widgets/
+  shared/
+    widgets/
+    extensions/
+The auth feature is entirely self-contained. Nothing outside auth/ imports from inside auth/ except the router. The router is in core/routing/ and it reads auth state to make routing decisions.
+Step 4 — Set up dependency injection before anything else.
+Use get_it as your service locator. Create a single injection_container.dart in core/. Every dependency — Supabase client, repositories, use cases, blocs — is registered here. Nothing is instantiated inside widgets. Nothing is instantiated inside blocs. Every dependency is injected. This is not optional for a production app. Testing requires this because you will swap real implementations for mocks.
+Step 5 — Initialize Supabase in main.dart before runApp.
+Supabase initialization is async. It must complete before your widget tree mounts. This means main() is async, you await Supabase initialization, then call runApp. The order is: initialize Supabase, register all dependencies in get_it, then runApp. If you call runApp before Supabase is ready, your session listener fires before the client exists and you get a race condition on first launch.
+Step 6 — Configure Supabase with the correct auth persistence settings.
+When initializing Supabase in Flutter, you pass auth options. You must explicitly set authFlowType to PKCE. Not implicit. PKCE (Proof Key for Code Exchange) is the correct OAuth flow for mobile apps. Implicit flow puts the access token in the URL fragment which is a security vulnerability. Supabase Flutter SDK defaults to PKCE but you must verify this explicitly in your initialization config and document it.
+Step 7 — Configure iOS-specific entitlements for Sign In with Apple.
+In your ios/Runner/Runner.entitlements file (you must create this if it does not exist), you need the Sign In with Apple capability. In Xcode, go to Signing and Capabilities, add the Sign In with Apple capability. This generates the entitlements entry automatically. Do this in Xcode, not by hand editing the file. Xcode validates it against your provisioning profile.
+Step 8 — Configure your Apple Developer account for Sign In with Apple.
+In the Apple Developer portal, under Certificates, Identifiers and Profiles, find your App ID. Enable the Sign In with Apple capability. Then create a Services ID for your web redirect (Supabase uses this). The Services ID needs a domain and return URL pointing to your Supabase project's auth callback URL: https://yourproject.supabase.co/auth/v1/callback. This is the URL Apple will redirect to after authentication. Supabase then redirects back to your app via deep link.
+Step 9 — Configure Google Sign In in Google Cloud Console.
+Create a project in Google Cloud Console. Enable the Google Sign In API. Create OAuth 2.0 credentials. You need two client IDs: one for iOS (type: iOS, requires your bundle ID) and one for Android (type: Android, requires your package name and SHA-1 fingerprint of your signing key). The SHA-1 for debug is different from release. Generate both now and register both. Add your Supabase callback URL as an authorized redirect URI.
+Step 10 — Configure Supabase Auth providers.
+In your Supabase dashboard under Authentication → Providers, enable Google and Apple. For Google, paste your Web client ID and secret from Google Cloud Console. For Apple, paste your Services ID, Team ID, Key ID, and the private key file content. These values come from the Apple Developer portal. The private key is a .p8 file. You download it once — Apple does not let you download it again.
+Step 11 — Configure deep link handling for your app.
+When Supabase finishes OAuth, it redirects back to your app via a deep link. You define this scheme. Format: yourappname://auth/callback. Register this in iOS Info.plist under CFBundleURLSchemes and in Android AndroidManifest.xml as an intent filter on your MainActivity. Also register this exact scheme in your Supabase dashboard under Authentication → URL Configuration → Redirect URLs. If these three places do not match exactly, OAuth will redirect successfully but your app will not receive the callback.
+Step 12 — Set up your Supabase database schema for auth.
+Create the profiles table. Do not modify the auth.users table — Supabase owns that. Your profiles table is in the public schema and has a one-to-one relationship with auth.users. Schema:
+profiles table:
+
+id — UUID, primary key, references auth.users(id) on delete cascade
+username — text, unique, not null (set during onboarding, not during auth)
+full_name — text, nullable (pulled from OAuth provider data)
+avatar_url — text, nullable (pulled from OAuth provider data)
+provider — text, not null (values: google, apple) — which provider they used
+is_onboarded — boolean, default false (set to true after they complete username setup)
+created_at — timestamptz, default now()
+updated_at — timestamptz, default now()
+
+Create a Postgres function and trigger that automatically inserts a row into profiles when a new row is inserted into auth.users. This means profile creation is atomic with user creation. It happens in the database, not in your Flutter app. If your Flutter app crashes after auth but before it can create the profile, the profile still exists because the trigger fired in Postgres.
+The trigger function reads from auth.users to pull raw_user_meta_data which contains the name and avatar URL from Google or Apple. Map those into your profiles columns in the trigger function.
+
+Section 2 — Database & RLS (Steps 13–22)
+Step 13 — Enable Row Level Security on the profiles table immediately.
+Never create a table without immediately enabling RLS. An unprotected table with RLS disabled is publicly readable and writable via Supabase's REST API by anyone who has your anon key. Your anon key is in your Flutter app and is not secret. Enable RLS on profiles the moment you create it. Before you write any policies.
+Step 14 — Write the SELECT policy for profiles.
+A user can read their own profile: auth.uid() = id. For reading other users' profiles (needed for social features later), create a separate policy: authenticated users can read any profile. Keep these as two separate policies. Do not combine them into one broad policy. Separation makes auditing easier.
+Step 15 — Write the INSERT policy for profiles.
+This is subtle. The trigger you created in Step 12 runs as the postgres superuser role, not as the authenticated user. So the trigger bypasses RLS. This is correct and intentional. You do not need an INSERT policy for the trigger. However, you should explicitly verify this by checking that no direct INSERT from an authenticated user is possible without a policy. The trigger is the only path to insertion.
+Step 16 — Write the UPDATE policy for profiles.
+A user can only update their own profile: auth.uid() = id. They cannot update other users' profiles. Verify this explicitly during testing.
+Step 17 — Write the DELETE policy for profiles.
+No user can delete a profile through the client. Deletion happens via account deletion flow which goes through your Go backend, which uses a service role key, which bypasses RLS. The client has no delete access. Explicitly write a policy that denies delete or simply write no delete policy (absence of policy means deny when RLS is enabled).
+Step 18 — Create the updated_at trigger.
+Create a Postgres function that sets updated_at = now() on every UPDATE. Attach this as a BEFORE UPDATE trigger on the profiles table. This is a standard production pattern. You never manually pass updated_at from the client. The database owns timestamps.
+Step 19 — Understand the service role key vs anon key distinction permanently.
+Your Flutter app uses the anon key. This key respects RLS. Your Go backend uses the service_role key. This key bypasses RLS. The service role key is never in your Flutter app. Never in your repository. Never in a config file that gets committed. It lives in environment variables on your Go server only. If you accidentally commit the service role key, rotate it immediately in Supabase dashboard.
+Step 20 — Set up the Supabase Auth email configuration even though you are not doing email auth.
+Supabase sends emails for account management — specifically for account deletion confirmation and email change confirmation. Configure your SMTP settings with a real email provider (Resend or Postmark, not the default Supabase SMTP which has strict rate limits). Set your From address. Set your app name. This is needed before launch.
+Step 21 — Configure Auth settings in Supabase dashboard.
+Under Authentication → Settings: set your Site URL to your app's deep link scheme. Set JWT expiry to 3600 seconds (1 hour) — this is the default and it is correct. Do not increase it. Set refresh token rotation to enabled. Set refresh token reuse interval to 10 seconds — this prevents race conditions where two requests simultaneously try to refresh the same token and one fails. Enable "Detect and block leaked passwords" — irrelevant for OAuth but good practice to have enabled for the future.
+Step 22 — Document your Supabase project reference ID and region.
+Your project URL, anon key, and region are needed in multiple places. Store these in a .env file that is gitignored. Use flutter_dotenv to load them at runtime. Never hardcode them as string literals in Dart files. This applies even to the anon key which is "public" — it belongs in config, not code, because config can be rotated without a code release.
+
+Section 3 — Clean Architecture Auth Implementation (Steps 23–45)
+Step 23 — Define the AuthUser entity in the domain layer.
+This is a pure Dart class with no Flutter imports and no Supabase imports. It contains: id (String), email (String, nullable — Apple can hide email), fullName (String, nullable), avatarUrl (String, nullable), provider (AuthProvider enum: google or apple), isOnboarded (bool). This entity is what your entire app knows about a user. Not the Supabase User object. If you ever switch auth providers, you only change the data layer, not this entity.
+Step 24 — Define the AuthFailure value objects in the domain layer.
+Authentication can fail in specific ways. Define these as sealed classes or a union type: NetworkFailure, CancelledByUser, ServerFailure, AccountExistsWithDifferentProvider, CredentialRevoked (Apple specific — user revoked app access in iOS settings), UnknownFailure. Each failure has a message. Your UI layer pattern matches on these to show the correct error message. Never show raw exception messages to users.
+Step 25 — Define the AuthRepository interface in the domain layer.
+This is an abstract class with these method signatures (in English, not code): sign in with Google returns either an AuthFailure or an AuthUser. Sign in with Apple returns either an AuthFailure or an AuthUser. Sign out returns either an AuthFailure or void. Get current user returns either null or an AuthUser. Watch auth state returns a stream of nullable AuthUser. Check if username is available returns either an AuthFailure or a boolean. Set username during onboarding returns either an AuthFailure or void. Delete account returns either an AuthFailure or void. This interface is your contract. The data layer implements it. The domain layer depends on this abstraction, never on the implementation.
+Step 26 — Define use cases in the domain layer.
+Each use case is a single class with a single call method. Use cases you need: SignInWithGoogleUseCase, SignInWithAppleUseCase, SignOutUseCase, GetCurrentUserUseCase, WatchAuthStateUseCase, CheckUsernameAvailabilityUseCase, SetUsernameUseCase, DeleteAccountUseCase. Each use case takes the repository interface as a constructor parameter. This is where your injection container wires things together.
+Step 27 — Create the AuthUserModel in the data layer.
+This extends or maps to AuthUser entity. It has a fromSupabaseUser factory constructor that takes a Supabase User object and maps it to your model. It has a toEntity method. This model also handles the JSON serialization for local caching. The entity has no serialization logic — that belongs here in the model.
+Step 28 — Create the RemoteAuthDataSource in the data layer.
+This class directly calls the Supabase auth client. It has methods corresponding to the repository interface. It throws typed exceptions (not generic exceptions) that the repository catches and converts to AuthFailure objects. This class is the only place in your entire codebase that imports Supabase directly.
+Step 29 — Create the LocalAuthDataSource in the data layer.
+This handles caching the auth session locally. Supabase Flutter SDK handles session persistence internally using SharedPreferences under the hood. You do not need to build session persistence yourself. But you do need a local data source for caching the user profile data (full name, avatar URL, username) so the app can display user information without a network call on every launch. Use flutter_secure_storage for sensitive data and shared_preferences for non-sensitive profile cache.
+Step 30 — Implement the AuthRepository in the data layer.
+This class implements the domain AuthRepository interface. It orchestrates between RemoteAuthDataSource and LocalAuthDataSource. It catches exceptions from the data sources and converts them to AuthFailure objects using a mapping function. It never lets raw exceptions escape to the domain or presentation layers. The repository is where error translation happens.
+Step 31 — Implement the Google Sign In flow in the data source specifically.
+Google Sign In on Flutter requires the google_sign_in package. The flow is: call googleSignIn.signIn() which opens the Google account picker. If user cancels, this returns null — you return a CancelledByUser failure. If successful, get the auth tokens from the GoogleSignInAccount. Get the idToken and accessToken. Call Supabase's signInWithIdToken with provider set to Google and pass the idToken and accessToken. Supabase validates the token with Google's servers, creates or retrieves the user in auth.users, and returns a session. You then convert this to your AuthUser entity.
+Step 32 — Implement the Apple Sign In flow specifically.
+Apple Sign In requires the sign_in_with_apple package. The flow is different from Google and has more complexity. Call SignInWithApple.getAppleIDCredential with scopes for fullName and email. Apple only gives you the full name and email on the very first sign in ever. On subsequent sign ins, Apple returns null for name and email. You must persist the name from the first sign in because you will never get it again. After getting the credential, call Supabase's signInWithIdToken with provider Apple and pass the identityToken from the Apple credential. Supabase validates with Apple's servers. Important: generate a nonce before calling Apple, pass it to the request, and pass the SHA-256 hash of the nonce to Supabase. This prevents replay attacks.
+Step 33 — Handle the Apple credential revocation case.
+Apple allows users to go to iOS Settings → Privacy → Apple ID → your app → Stop Using Apple ID. When this happens, your app receives a credentialRevoked notification. You must listen to this notification using the sign_in_with_apple package's getCredentialState method. On app foreground, check the credential state. If it returns revoked, immediately sign the user out and route to the auth screen. This is an Apple platform requirement, not optional.
+Step 34 — Handle the case where Apple hides the user's email.
+When a user chooses "Hide My Email" in Apple Sign In, Apple gives you a relay email address in the format randomstring@privaterelay.appleid.com. This is a real email that forwards to the user's real email. Store it as-is. Never try to display it to the user as their email. In your profiles table, the email column should be nullable and you should not rely on email for anything user-facing. Use the Supabase user ID as the identifier, always.
+Step 35 — Handle account linking — same person, two providers.
+If a user signs in with Google using john@gmail.com and later tries to sign in with Apple using the same underlying email (or Apple's relay email that maps to john@gmail.com), Supabase will reject the second sign in with an error indicating the email is already associated with a different provider. This is the AccountExistsWithDifferentProvider failure. Your UI must handle this case explicitly with a clear message: "You previously signed in with Google. Please use Google to sign in." Do not try to automatically link accounts — this is a security decision that requires explicit user consent.
+Step 36 — Implement Sign Out correctly.
+Sign out has two parts: sign out from Supabase (which invalidates the server-side session and clears the local session), and sign out from the native provider (Google or Apple). For Google, call googleSignIn.signOut() to clear the Google account from the native Google Sign In SDK. If you only sign out from Supabase but not from Google, the next time the user taps "Sign in with Google" it will silently sign in with the same Google account without showing the account picker. This is confusing UX. Sign out from both. For Apple, there is no native sign out — the OS handles it.
+Step 37 — Implement the Watch Auth State stream.
+Supabase.instance.client.auth.onAuthStateChange is a stream that emits an AuthState event every time the auth state changes. Events include: signedIn, signedOut, tokenRefreshed, userUpdated, passwordRecovery. Map these events to your domain AuthUser? stream. Your AuthBloc (coming in next section) subscribes to this stream on creation and never unsubscribes until the app terminates. This is the heartbeat of your auth system.
+Step 38 — Implement the Delete Account flow.
+Account deletion is regulated by App Store and Play Store policies — you must provide it. The flow: user requests deletion in app → your Flutter app sends a delete request to your Go backend with their JWT → Go backend verifies the JWT → Go backend calls Supabase Admin API using service role key to delete the user from auth.users → the cascade delete you configured in Step 12 propagates to profiles → Go backend returns success → Flutter signs out the user locally and routes to auth screen. Never delete the account from the Flutter client directly — the service role key required for this must never be in the client.
+Step 39 — Implement the onboarding gate.
+After successful authentication, check isOnboarded from the profile. If false, route to the username setup screen before showing the main app. The username screen validates username availability (min 3 chars, max 20, alphanumeric plus underscores, no leading or trailing underscores, no consecutive underscores — these rules are enforced both client-side and in a Postgres CHECK constraint). Once username is set, update is_onboarded to true and route to main app. This onboarding gate runs exactly once per user lifetime.
+Step 40 — Create the CheckUsername use case with debouncing.
+As the user types their username, you want to check availability in real time. The use case itself has no debouncing — that belongs in the presentation layer (the Bloc). The use case simply calls the repository which queries Supabase. In your Postgres query, check the profiles table for existence of that username. This query must use an index — add a unique index on profiles.username. Without the index, this query does a full table scan and at Strava scale that is unacceptable.
+Step 41 — Handle the first-launch vs returning-user distinction in data.
+When your auth state stream emits a signed-in event, you need to know if this is a new user (just created, is_onboarded is false) or a returning user (is_onboarded is true). Fetch the profile from Supabase immediately after the signed-in event. Do not trust the Supabase User's createdAt timestamp for this — use your is_onboarded flag. This fetch must be fast — add an index on profiles.id (it is the primary key, so the index exists automatically).
+Step 42 — Handle session restoration on app cold start correctly.
+When the app launches, Supabase's Flutter SDK automatically restores the session from local storage if a valid session exists. This is synchronous for checking existence and async for the token refresh if the access token is expired. Your splash screen must wait for this to resolve. The correct pattern: listen to the first event from the auth state stream. If it is signedIn, proceed as authenticated. If it is signedOut, proceed as unauthenticated. Do not attempt to call Supabase.instance.client.auth.currentUser synchronously and trust the result before the stream has emitted — the stream emission is the confirmation that session restoration is complete.
+Step 43 — Handle token refresh failure.
+If the refresh token itself is expired (Supabase default is 7 days inactive refresh token expiry), Supabase will fail to refresh and emit a signedOut event. Your app must handle this by routing to the auth screen. The user sees a message: "Your session has expired. Please sign in again." This is not an error — it is a designed expiry. Handle it gracefully with a clear message, not a crash or blank screen.
+Step 44 — Configure background token refresh.
+When your app is backgrounded for extended periods and comes back to foreground, the access token may be expired. Supabase Flutter SDK handles refresh on foreground automatically, but you must ensure your app's lifecycle observer is correctly hooked up. Use WidgetsBindingObserver in your app-level widget to detect foreground resume. On resume, trigger a session check. The SDK will refresh if needed. This prevents the case where a user opens the app after several hours and gets an expired token error on their first API call to Go.
+Step 45 — Implement the Go backend JWT validation.
+Your Go backend receives every request with an Authorization: Bearer <jwt> header. Go fetches the JWKS from https://yourproject.supabase.co/auth/v1/.well-known/jwks.json. Cache this JWKS in memory with a refresh interval of 1 hour — do not fetch it on every request. Parse the JWT header to get the kid (key ID). Find the matching key in the JWKS. Validate the signature. Validate exp claim (not expired). Validate iss claim (matches your Supabase project URL). Validate aud claim (must be authenticated). If all pass, extract the sub claim which is the user's UUID. Use this UUID for all database queries. Use the golang-jwt/jwt library or lestrrat-go/jwx for this. Never validate JWTs manually.
+
+Section 4 — Presentation Layer & Bloc (Steps 46–65)
+Step 46 — Define AuthEvent sealed class.
+Events: AuthStarted (app launched, begin session check), AuthGoogleSignInRequested, AuthAppleSignInRequested, AuthSignOutRequested, AuthDeleteAccountRequested, AuthUsernameSubmitted(String username), AuthUsernameChanged(String username) (for real-time validation). Sealed class means exhaustive pattern matching. Every UI action maps to exactly one event. Events are immutable — use final fields and override equality.
+Step 47 — Define AuthState sealed class.
+States: AuthInitial (before session check), AuthLoading (during any auth operation), AuthAuthenticated(AuthUser user, bool isOnboarded), AuthUnauthenticated, AuthError(AuthFailure failure), AuthOnboarding(AuthUser user) (authenticated but username not set), UsernameChecking, UsernameAvailable(String username), UsernameUnavailable(String username), UsernameInvalid(String reason). States are immutable. Override equality and hashCode or extend Equatable.
+Step 48 — Implement the AuthBloc.
+The AuthBloc is created once at app start and lives for the entire app lifetime. It is not scoped to a screen. It is provided at the root of your widget tree via BlocProvider. On creation, it immediately subscribes to the WatchAuthStateUseCase stream and dispatches AuthStarted. It never disposes this subscription — the Bloc's close method cancels it. The Bloc's event handlers are all async and handle the Either return type from use cases by folding on left (failure) and right (success).
+Step 49 — Handle the AuthStarted event in the Bloc.
+This is the first event dispatched when the app opens. Emit AuthInitial (do not emit AuthLoading here — the loading is implicit in the splash screen). Wait for the first emission from the auth state stream. If the stream emits a user, fetch their profile from Supabase. If isOnboarded is false, emit AuthOnboarding. If true, emit AuthAuthenticated. If the stream emits null, emit AuthUnauthenticated. This entire sequence must complete within 300ms. Measure it.
+Step 50 — Handle the Google Sign In event in the Bloc.
+Emit AuthLoading. Call SignInWithGoogleUseCase. On failure, emit AuthError with the specific failure. On success, check isOnboarded flag from the profile. Emit AuthOnboarding or AuthAuthenticated accordingly. The Bloc does not know about navigation — it emits state. The UI listens and navigates.
+Step 51 — Handle the Apple Sign In event in the Bloc.
+Same pattern as Google. Additional consideration: the Bloc must not handle the nonce generation — that is a data layer concern inside the Apple data source. The Bloc only dispatches the event and reacts to the result.
+Step 52 — Handle username validation in the Bloc.
+On AuthUsernameChanged, apply a Debounce transformer on the event stream — specifically for this event type only, not for all events. A 500ms debounce is appropriate. Client-side validate format first (regex for allowed characters, length). If format is invalid, immediately emit UsernameInvalid without a network call. If format is valid, emit UsernameChecking, call CheckUsernameAvailabilityUseCase, emit UsernameAvailable or UsernameUnavailable. Use flutter_bloc's EventTransformer with restartable() from bloc_concurrency for this specific event.
+Step 53 — Handle concurrent events correctly.
+Different events have different concurrency requirements. Sign in events should be droppable() — if one is already in progress, ignore new ones. Username check events should be restartable() — cancel the previous check when a new one comes in. Use bloc_concurrency package for these transformers. Apply them per event handler, not globally.
+Step 54 — Set up the AppRouter.
+Use go_router for navigation. Your router has a redirect function that inspects auth state. If state is AuthInitial or AuthLoading, redirect to splash. If state is AuthUnauthenticated, redirect to auth screen. If state is AuthOnboarding, redirect to username setup screen. If state is AuthAuthenticated, redirect to home screen. The router listens to a Listenable derived from your AuthBloc using BlocListenable pattern. When auth state changes, the router re-evaluates its redirect logic. This is declarative routing — you never call Navigator.push for auth transitions. The state machine drives navigation automatically.
+Step 55 — Build the SplashScreen widget.
+This is a StatelessWidget. It renders your app logo centered on a black background (matching your app's color scheme). No animation on first paint — animation takes time and you want to be done and gone in 300ms. The splash screen is shown while AuthInitial or AuthLoading state is active. It has no buttons, no text beyond the logo. It must be as lightweight as possible — no heavy computations, no images that need network calls. The logo is a local asset bundled with the app.
+Step 56 — Build the AuthScreen widget.
+This is a StatelessWidget that consumes AuthBloc state. It has a BlocListener to react to state changes (navigate to onboarding or home). It has a BlocBuilder to show loading states (disable buttons when AuthLoading). Structure: full screen, your brand hero image or gradient background, app logo, tagline, Sign in with Google button, Sign in with Apple button, privacy policy and terms link at the bottom. Nothing else. No email field. No password field.
+Step 57 — Build the Sign In with Google button correctly.
+This is not a generic button with a Google logo slapped on. Google has brand guidelines for their button. The button must use the exact Google colors, the exact Google logo (the multicolor G), and the exact text "Sign in with Google". Deviating from this can cause issues during App Store review and Play Store review. Google provides official assets. Use them. The button height is 48dp minimum as per Google's guidelines.
+Step 58 — Build the Sign In with Apple button correctly.
+Apple is even stricter. You must use Apple's ASAuthorizationAppleIDButton via the platform channel, or the sign_in_with_apple package provides a Flutter widget that wraps it correctly. The button text must be "Sign in with Apple" or "Continue with Apple". The Apple logo must be the official one. Apple rejects apps that use custom-drawn Apple buttons. The button adapts to light and dark mode automatically when using the official widget.
+Step 59 — Build the OnboardingScreen (username setup).
+This screen is shown exactly once. It has: a welcome message addressing the user by their name (from Google/Apple), a text field for username, real-time availability indicator (checking spinner, green checkmark for available, red X for unavailable or invalid), a Continue button that is disabled until username is valid and available. The text field debounces automatically via the Bloc. The screen cannot be dismissed or back-navigated — the user must complete onboarding. Achieve this by removing the back button and intercepting the system back gesture using PopScope (previously WillPopScope).
+Step 60 — Handle the loading state in UI correctly.
+When AuthLoading is emitted, both sign in buttons must be disabled and show loading indicators. Do not show a full-screen overlay that blocks interaction — disable the buttons themselves and show a spinner inside each (or replace the button text with a spinner). A full-screen loading overlay is bad UX because it feels like the app has frozen. Button-level loading indicators are honest — they show exactly what is happening.
+Step 61 — Handle error states in UI correctly.
+When AuthError is emitted, pattern match on the AuthFailure type and show the appropriate message. Use a SnackBar for transient errors like network failures. Use an inline message for persistent errors. Never use AlertDialog for auth errors — it blocks the UI and feels heavy. CancelledByUser should show nothing — the user intentionally cancelled, showing an error is noise.
+Step 62 — Implement the privacy policy and terms of service links.
+App Store requires that your auth screen link to your privacy policy and terms of service. These links must be functional before submission. Host these pages. They can be simple web pages. The links open in an in-app browser using url_launcher. They must be visible without scrolling on the auth screen. This is a review guideline, not optional.
+Step 63 — Implement haptic feedback on button interactions.
+When a user taps a sign in button, trigger a light haptic impact. When authentication succeeds, trigger a medium haptic success notification. When authentication fails, trigger a haptic error notification. Use Flutter's HapticFeedback class. This costs nothing in performance and substantially improves the premium feel of the app.
+Step 64 — Handle the back navigation edge case on Android.
+Android has a physical or gesture back button. On the auth screen, pressing back should exit the app, not navigate to a previous screen (there is none). Use PopScope with canPop: false and an onPopInvoked callback that calls SystemNavigator.pop() to exit the app cleanly. On the onboarding screen, back should also be blocked — the user cannot go back to the auth screen after signing in successfully.
+Step 65 — Implement the Sign Out flow in UI.
+Sign out is triggered from a settings screen (not auth). But the auth Bloc handles it. When AuthSignOutRequested is dispatched, the Bloc calls SignOutUseCase, which signs out from Supabase and from the native Google SDK. The Bloc emits AuthUnauthenticated. The router sees this state and redirects to the auth screen. The entire navigation stack is cleared. The user cannot press back to get to the previous screen. This happens automatically because the router's redirect logic governs all navigation.
+
+Section 5 — Security (Steps 66–75)
+Step 66 — Never log auth tokens.
+Add a rule to your logging configuration: strings matching JWT patterns are redacted. Never print the session object. Never print the user object in full (it contains the email). In debug mode, log only non-sensitive fields like user ID. In release mode, structured logging goes to your server — ensure PII (personally identifiable information) is never included. This is a GDPR/privacy requirement, not just a best practice.
+Step 67 — Implement certificate pinning for Go backend communication.
+Your Flutter app communicates with your Go backend over HTTPS. Configure certificate pinning to prevent man-in-the-middle attacks. Use the dio HTTP client with a custom HttpClientAdapter that pins to your server's certificate. This means your app only trusts your server's certificate, not any certificate signed by any CA. Downside: if you rotate your certificate, you must also release an app update. Plan your certificate rotation strategy accordingly (use leaf certificate pinning with a backup pin).
+Step 68 — Implement jailbreak and root detection.
+Use the flutter_jailbreak_detection package. On app launch, before the auth flow, check if the device is jailbroken (iOS) or rooted (Android). If detected, you have a choice: block the app entirely or show a warning and allow continuation. For a fitness app at this scale, showing a warning and allowing continuation is the right balance — you do not want to block legitimate users who root their phones for development reasons. Log the detection event to your analytics.
+Step 69 — Implement SSL/TLS for all network communication.
+Every call to your Go backend must use HTTPS. Every call to Supabase uses HTTPS by default. In debug mode you may be tempted to use HTTP for a local Go server — use mkcert to create a locally-trusted certificate and always use HTTPS even locally. This way your security posture is identical in debug and release. Never ship a release build that allows HTTP.
+Step 70 — Store nothing sensitive in plain SharedPreferences.
+The Supabase Flutter SDK stores the session in SharedPreferences by default. This is acceptable because the session tokens are rotated and short-lived. However, if you cache any other sensitive user data (profile info that could be PII), use flutter_secure_storage which uses iOS Keychain and Android Keystore. These are hardware-backed secure storage mechanisms.
+Step 71 — Implement rate limiting awareness in the client.
+Supabase Auth has rate limits on sign-in attempts. If a user (or attacker) hammers the sign-in button, Supabase will return a 429 error. Your error mapping must handle 429 responses specifically — show a clear message "Too many attempts. Please wait a moment." and implement an exponential backoff before allowing retry. The UI should disable the buttons temporarily after multiple failures.
+Step 72 — Configure Supabase Auth rate limits explicitly.
+In your Supabase dashboard under Authentication → Rate Limits, configure the limits explicitly. Do not rely on defaults which are generous for development but may be too permissive for production. Set sign-in rate limits appropriate for your expected traffic. Document these limits.
+Step 73 — Implement session security on app backgrounding.
+When your app is backgrounded, sensitive information (user profile, tokens) should not be visible in the iOS app switcher screenshot. Use the secure_application package or manually overlay a view on app background using WidgetsBindingObserver. On iOS this is especially important because the OS takes a screenshot when you press home.
+Step 74 — Handle account takeover scenario.
+If Supabase detects a suspicious sign-in (same account from a very different location), it can revoke the session. Your auth state stream will emit a signedOut event. Your app handles this the same way as token expiry — route to auth screen with message "Your session was ended for security reasons. Please sign in again." The Go backend also validates JWTs and will reject a revoked session's tokens.
+Step 75 — Implement audit logging for auth events in Go.
+Every sign-in, sign-out, failed sign-in, and account deletion should be logged to a table in your Postgres database. This is not the Supabase Auth log — that is for debugging. This is your application-level audit log. Table structure: event type, user ID (nullable for failed attempts), timestamp, IP address (received from Go backend), device info (from request headers), outcome (success or failure reason). Your Go backend writes this log after validating the JWT on every auth-related request. This is required for compliance and invaluable for debugging production issues.
+
+Section 6 — Testing (Steps 76–100+)
+Step 76 — Unit test the AuthUser entity.
+Test: entity creation with all fields. Entity creation with nullable fields as null. Equality — two entities with same fields are equal. No external dependencies needed. These tests run in milliseconds.
+Step 77 — Unit test AuthFailure classes.
+Test: each failure type has a message. Pattern matching on failure type is exhaustive. Equality works correctly.
+Step 78 — Unit test each use case.
+For each use case: mock the repository using mocktail. Test the success path. Test each specific failure path. Test that the use case calls the repository method exactly once with the correct parameters. Do not test the implementation — test the behavior. For CheckUsernameAvailabilityUseCase, test with valid username (available), valid username (unavailable), invalid format username (should not reach repository), empty string.
+Step 79 — Unit test the AuthRepository implementation.
+Mock both data sources. Test: when remote data source succeeds, repository returns right of AuthUser. When remote data source throws NetworkException, repository returns left of NetworkFailure. When remote data source throws CancelledByUserException, repository returns left of CancelledByUser. Every exception type maps to exactly one failure type. Test all mappings.
+Step 80 — Unit test the AuthBloc.
+Use bloc_test package. For each event: test initial state, test states emitted in order, test final state. AuthStarted when user exists: emits [AuthLoading, AuthAuthenticated]. AuthStarted when user does not exist: emits [AuthLoading, AuthUnauthenticated]. AuthGoogleSignInRequested success: emits [AuthLoading, AuthAuthenticated]. AuthGoogleSignInRequested failure (network): emits [AuthLoading, AuthError]. AuthGoogleSignInRequested cancelled: emits [AuthLoading, AuthUnauthenticated]. Test every event with every possible outcome. This is your most important test suite.
+Step 81 — Unit test the debounce behavior on username events.
+Test that rapid AuthUsernameChanged events result in only one repository call after the debounce period. Use fakeAsync and FakeTimers if needed. Test that the last value is the one that reaches the repository, not the first.
+Step 82 — Integration test the Supabase connection.
+Not a unit test — a real test against your Supabase project. Use a dedicated test project in Supabase, not your production project. Test: can connect to Supabase, can read from profiles table with correct RLS (authenticated user can read own profile), cannot read other users' profiles (verify RLS enforcement), cannot insert directly into profiles (trigger handles it), cannot delete any profile from client.
+Step 83 — Integration test the full Google Sign In flow.
+This requires a real Google account. In Flutter integration tests, you cannot automate the OAuth flow because it requires native UI interaction. Instead, test the flow manually and document the test steps: open app, tap Sign in with Google, select test account, verify navigation to home screen or onboarding, verify profile exists in Supabase, verify session is persisted (close app, reopen, verify user is still signed in).
+Step 84 — Integration test the full Apple Sign In flow.
+Requires a real device (Apple Sign In does not work on simulators with a real Apple ID). Use a test Apple ID. Same manual flow: open app, tap Sign in with Apple, complete Apple auth, verify navigation, verify profile, verify session persistence.
+Step 85 — Test the onboarding flow.
+Create a test user in Supabase with is_onboarded = false. Sign in with that user. Verify routing goes to onboarding screen, not home. Enter username. Verify username appears in profiles table. Verify is_onboarded is set to true. Verify routing goes to home screen after username submission. Verify back button does not work on onboarding screen.
+Step 86 — Test session persistence across app restarts.
+Sign in with Google. Force-close the app (not background — fully close from app switcher). Reopen the app. Verify the splash screen appears briefly and then transitions directly to home screen without showing auth screen. Measure the time from app launch to home screen appearance. Target: under 1 second on a mid-range device.
+Step 87 — Test token refresh.
+This is tricky to test because you need to wait for the access token to expire (1 hour by default). Workaround: temporarily set your Supabase JWT expiry to 60 seconds in your test project. Sign in. Wait 60 seconds. Make a request to your Go backend. Verify the request succeeds (meaning the SDK automatically refreshed the token). Verify the auth state stream did not emit signedOut during this period. Restore the JWT expiry to 3600 seconds.
+Step 88 — Test the sign out flow.
+Sign in. Tap sign out. Verify: Supabase session is cleared, Google Sign In native state is cleared (next Google sign in shows account picker), navigation goes to auth screen, cannot navigate back to home screen, no cached user data remains in memory.
+Step 89 — Test the cancelled sign in flow.
+Tap Sign in with Google. When the account picker appears, press back or cancel. Verify: auth screen remains visible, no error message is shown, buttons are re-enabled, no error is logged, Bloc is in AuthUnauthenticated state.
+Step 90 — Test the network failure scenario.
+Using network link conditioner on iOS or network emulation on Android, disable network completely. Tap Sign in with Google. The Google account picker will not open without network. Verify the error is caught and shown as a network error, not a crash. Re-enable network. Verify sign in works correctly.
+Step 91 — Test RLS policies exhaustively.
+Use the Supabase SQL editor. Run queries as different users using SET LOCAL ROLE authenticated; SET LOCAL "request.jwt.claims" = '{"sub": "user-uuid-here"}'. Verify: authenticated user can SELECT their own profile row. Authenticated user cannot SELECT another user's profile row (should return empty). Authenticated user cannot INSERT into profiles directly. Authenticated user cannot UPDATE another user's profile. Authenticated user cannot DELETE any profile.
+Step 92 — Test the account deletion flow.
+Sign in. Request account deletion through your Go backend endpoint. Verify: Go backend receives the JWT, validates it, calls Supabase Admin API to delete user, auth.users row is deleted, profiles row is cascade-deleted, Flutter receives signedOut auth state event, navigation goes to auth screen. Try signing in again with the same credential — verify the account no longer exists and a new account is created (effectively a new user).
+Step 93 — Performance test the splash screen.
+Use Flutter's traceAction API to measure the time from app launch to auth state resolution. Record this number. Target: under 300ms on a mid-range Android device (Pixel 4a equivalent). Run this measurement 10 times and take the median. Document the numbers. Any regression from this baseline is a bug.
+Step 94 — Performance test the auth screen rendering.
+Use flutter_driver or integration_test to measure the time from navigation to auth screen to when the screen is fully interactive (buttons respond). Target: under 16ms per frame (60 FPS) throughout the transition animation. Use Flutter DevTools Performance tab to verify no jank frames during the auth screen entrance animation.
+Step 95 — Test on a slow network (3G simulation).
+With network link conditioner set to 3G speeds, test the full sign in flow. Verify: loading indicators appear immediately, buttons disable during the network operation, the operation eventually completes (or times out with a clear error), the app does not crash, no silent failures.
+Step 96 — Test on a low-memory device.
+On an older device or with memory pressure simulation, verify: the app does not crash during auth, the Bloc is not garbage collected mid-operation, session data is not corrupted by memory pressure, the splash screen resolves correctly even under memory constraints.
+Step 97 — Test the Apple credential revocation flow.
+Sign in with Apple. Go to iOS Settings → your Apple ID → Password and Security → Apps using your Apple ID → find your app → Stop using Apple ID. Re-open your app. Verify: the app detects the revocation (via credential state check on foreground), signs the user out, and routes to the auth screen with an appropriate message.
+Step 98 — Widget test the AuthScreen.
+Using Flutter's widget testing framework: pump the AuthScreen with a mocked AuthBloc. Test: both buttons are visible, buttons are enabled in AuthUnauthenticated state, buttons are disabled in AuthLoading state, error snackbar appears in AuthError state with the correct message, privacy policy link is visible. No real network calls. No real auth. Pure widget behavior.
+Step 99 — Widget test the OnboardingScreen.
+Pump with mocked Bloc. Test: username field is empty initially, continue button is disabled initially, entering fewer than 3 characters shows invalid message, entering valid username triggers check event, UsernameChecking state shows spinner, UsernameAvailable state shows checkmark and enables button, UsernameUnavailable state shows error and disables button, tapping continue with available username dispatches AuthUsernameSubmitted event.
+Step 100 — Set up CI/CD to run all tests on every commit.
+Use GitHub Actions or equivalent. Pipeline: run all unit tests (must pass), run all widget tests (must pass), run static analysis (flutter analyze — zero warnings, zero hints), run dart format --output=none --set-exit-if-changed . to verify formatting (your code must be formatted), run flutter build apk --release and flutter build ios --release --no-codesign to verify the build compiles without errors. Any failure blocks merge. This pipeline runs in under 5 minutes. Auth is done when this pipeline is green.
+
+Step 101 — Document everything.
+Before you close this chapter on auth: write a one-page auth architecture document. It contains: the state machine diagram (all states and transitions), the file structure of the auth feature, the environment variables required, the Supabase configuration checklist, the Apple Developer configuration checklist, the Google Cloud Console configuration checklist, the test accounts used for testing, the known limitations and decisions made with their reasoning. This document is for you six months from now when you have forgotten all of this. Future you will be grateful.
