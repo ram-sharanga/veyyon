@@ -21,7 +21,6 @@ class AuthUser {
     String? id,
     String? email,
     String? name,
-    String? avatarUrl,
     bool? isOnboarded,
   }) {
     return AuthUser(
@@ -43,15 +42,8 @@ class AuthUser {
   }
 
   @override
-  int get hashCode {
-    return Object.hash(id, email, name, isOnboarded);
-  }
+  int get hashCode => Object.hash(id, email, name, isOnboarded);
 
   @override
-  String toString() {
-    // Never include email in toString - it's PII.
-    // Never include tokens - they're security-sensitive.
-    // Only include non-sensitive identifiers.
-    return 'AuthUser(id: $id, isOnboarded: $isOnboarded)';
-  }
+  String toString() => 'AuthUser(id: $id, isOnboarded: $isOnboarded)';
 }
