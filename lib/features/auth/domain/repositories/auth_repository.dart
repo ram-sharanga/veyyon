@@ -7,6 +7,8 @@
 import 'package:dartz/dartz.dart';
 import 'package:veyyon/features/auth/domain/entities/auth_failure.dart';
 import 'package:veyyon/features/auth/domain/entities/auth_user.dart';
+import 'package:veyyon/features/auth/domain/usecases/send_email_flow_usecase.dart';
+import 'package:veyyon/features/auth/domain/usecases/verify_otp_usecase.dart';
 
 // What is Either<L, R>?
 // It's a type from the dartz package that represents one of two values.
@@ -50,6 +52,21 @@ abstract class AuthRepository {
   ///
   /// Returns Right(null) on success
   Future<Either<AuthFailure, void>> sendNewUserLink(String email);
+
+  /// Backend-driven flow (Option 2 — recommended).
+  /// Sends email to Go backend which decides magic vs new user.
+  /// Returns which type of link was sent.
+  /// Falls back to client-side check when Go backend unavailable.
+  Future<Either<AuthFailure, EmailLinkType>> sendEmailFlow(String email);
+
+  /// Verifies an OTP token (6-digit code or magic link token).
+  /// Called when processing a deep link manually or a typed OTP.
+  /// Returns the authenticated user on success.
+  Future<Either<AuthFailure, AuthUser>> verifyOtp({
+    required String email,
+    required String token,
+    required OtpVerificationType type,
+  });
 
   /// Signs the user out of both Supabase and the native provider SDK.
   ///
