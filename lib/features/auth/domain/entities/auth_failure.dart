@@ -69,3 +69,17 @@ final class MagicLinkAlreadyUsed extends AuthFailure {
 final class InvalidEmailFormat extends AuthFailure {
   const InvalidEmailFormat() : super('Please enter a valid email address.');
 }
+
+/// Too many auth attempts in a short period.
+/// Supabase returns 429 when rate limits are exceeded.
+/// UI response: Show "Too many attempts. Please wait a moment."
+/// and implement exponential backoff before re-enabling buttons.
+final class RateLimitExceeded extends AuthFailure {
+  /// Seconds to wait before the next attempt is allowed.
+  /// Supabase includes this in the Retry-After header.
+  /// If unknown, default to 60 seconds.
+  final int retryAfterSeconds;
+
+  const RateLimitExceeded({this.retryAfterSeconds = 60})
+    : super('Too many attempts. Please wait before trying again.');
+}
