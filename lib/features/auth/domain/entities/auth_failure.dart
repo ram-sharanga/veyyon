@@ -40,3 +40,32 @@ final class CredentialRevoked extends AuthFailure {
 final class UnknownFailure extends AuthFailure {
   const UnknownFailure([super.message = 'An unknown error occurred.']);
 }
+
+/// User entered email that has no account.
+/// Shown when they try to get a magic link but aren't registered.
+/// This triggers the "new user" flow — send them the website link instead.
+final class EmailNotRegistered extends AuthFailure {
+  const EmailNotRegistered()
+    : super('No account found with this email address.');
+}
+
+/// The magic link the user clicked has expired.
+/// Supabase OTP links expire after a configurable period (default 1 hour).
+final class MagicLinkExpired extends AuthFailure {
+  const MagicLinkExpired()
+    : super('This sign-in link has expired. Please request a new one.');
+}
+
+/// The magic link was already used.
+/// Supabase OTP links are one-time use.
+final class MagicLinkAlreadyUsed extends AuthFailure {
+  const MagicLinkAlreadyUsed()
+    : super(
+        'This sign-in link has already been used. Please request a new one.',
+      );
+}
+
+/// Email format is invalid (client-side check before any network call).
+final class InvalidEmailFormat extends AuthFailure {
+  const InvalidEmailFormat() : super('Please enter a valid email address.');
+}
